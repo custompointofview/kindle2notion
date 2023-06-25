@@ -1,12 +1,16 @@
+from re import T
+import time
+from retry import retry
 from datetime import datetime
 from typing import Dict, List, Tuple
+from requests import get
+
+from tqdm import tqdm
 
 import notional
 from notional.blocks import Paragraph, TextObject
 from notional.query import TextCondition
 from notional.types import Date, ExternalFile, Number, RichText, Title
-from requests import get
-
 from notional.text import Annotations, FullColor
 
 # from more_itertools import grouper
@@ -16,6 +20,14 @@ NO_COVER_IMG = "https://via.placeholder.com/150x200?text=No%20Cover"
 NOTE_ANNOTATION = ">>> NOTE <<<"
 
 
+@retry(
+    tries=5,
+    delay=1,
+)
+def execute(callback):
+    callback()
+
+
 def export_to_notion(
     all_books: Dict,
     enable_highlight_date: bool,
@@ -23,12 +35,12 @@ def export_to_notion(
     notion_api_auth_token: str,
     notion_database_id: str,
 ) -> None:
-    print("Initiating transfer...\n")
+    print("~ Initiating transfer...\n")
 
     for title in all_books:
-        each_book = all_books[title]
-        author = each_book["author"]
-        clippings = each_book["highlights"]
+        book = all_books[title]
+        author = book["author"]
+        clippings = book["highlights"]
         clippings_count = len(clippings)
         (
             formatted_clippings,
@@ -44,8 +56,7 @@ def export_to_notion(
             notion_database_id,
             enable_book_cover,
         )
-        if message != "None to add":
-            print("✓", message)
+        print("✓", message)
 
 
 def _prepare_aggregated_text_for_one_book(
@@ -94,68 +105,100 @@ def _add_book_to_notion(
     title_exists = False
     current_clippings_count = 0
 
+    # Add separator
+    title_and_author = title + " (" + str(author) + ")"
+    print(title_and_author)
+    print("-" * len(title_and_author))
+
+    print(f"~ Query book in Notion...")
+    time.sleep(0.1)
     query = (
         notion.databases.query(notion_database_id)
-        .filter(property="Title", rich_text=TextCondition(contains=title))
+        .filter(property="Title", rich_text=TextCondition(contains=title.strip()))
+        .filter(property="Author", rich_text=TextCondition(equals=author.strip()))
         .limit(1)
     )
     data = query.first()
 
     if data:
+        print("~ Page might exist, checking if data is correct...")
         title_exists = True
         block_id = data.id
-        block = notion.pages.retrieve(block_id)
+        page = notion.pages.retrieve(block_id)
         page_last_highlighted = datetime.strftime(
-            datetime.strptime(str(block["Last Highlighted"]), "%Y-%m-%d %H:%M:%S%z"),
+            datetime.strptime(str(page["Last Highlighted"]), "%Y-%m-%d %H:%M:%S%z"),
             "%Y-%m-%d %H:%M",
         )
         clips_last_highlight = datetime.strftime(last_date, "%Y-%m-%d %H:%M")
-        if block["Highlights"] == None:
-            block["Highlights"] = Number[0]
+        if page["Highlights"] == None:
+            page["Highlights"] = Number[0]
         elif (
-            int(float(str(block["Highlights"]))) == int(clippings_count)
+            int(float(str(page["Highlights"]))) == int(clippings_count)
             and clips_last_highlight == page_last_highlighted
         ):  # if no change in clippings
-            title_and_author = str(block["Title"]) + " (" + str(block["Author"]) + ")"
-            print(title_and_author)
-            print("-" * len(title_and_author))
+            if enable_book_cover:
+                # Fetch a book cover from Google Books if the cover for the page is not set
+                if page.cover is None:
+                    print("~ Adding book cover...")
+                    result = _get_book_cover_uri(title, author)
+
+                    if result is None:
+                        # Set the page cover to a placeholder image
+                        cover = ExternalFile[NO_COVER_IMG]
+                        print(
+                            "× Book cover couldn't be found. "
+                            "Please replace the placeholder image with the original book cover manually."
+                        )
+                    else:
+                        # Set the page cover to that of the book
+                        cover = ExternalFile[result]
+                    notion.pages.set(page, cover=cover)
+                    print("✓ Book cover added!")
+
             return "Page already exists & nothing new to add.\n"
-
-    title_and_author = title + " (" + str(author) + ")"
-    print(title_and_author)
-    print("-" * len(title_and_author))
-
-    if title_exists and (
-        int(float(str(block["Highlights"]))) != int(clippings_count)
-        or page_last_highlighted != clips_last_highlight
-    ):
-        print("- Page already exists & updates are available")
-        page = notion.pages.retrieve(block_id)
-        notion.pages.delete(page)
-        print("- Old page is now archived")
-        title_exists = False
 
     # Add a new book to the database
     if not title_exists:
-        new_page = notion.pages.create(
+        print("~ Creating a new page...")
+        page = notion.pages.create(
             parent=notion.databases.retrieve(notion_database_id),
             properties={
                 "Title": Title[title],
                 "Author": RichText[author],
-                "Highlights": Number[clippings_count],
-                "Last Highlighted": Date[last_date.isoformat()],
-                "Last Synced": Date[datetime.now().isoformat()],
             },
             children=[],
         )
-        page_contents = _update_book_with_clippings(formatted_clippings)
-        for paragraph in page_contents:
-            notion.blocks.children.append(new_page, paragraph)
-        block_id = new_page.id
-        if enable_book_cover:
-            # Fetch a book cover from Google Books if the cover for the page is not set
-            if new_page.cover is None:
-                result = _get_book_cover_uri(title, author)
+        print("✓ Page created.")
+
+    if title_exists and (
+        int(float(str(page["Highlights"]))) != int(clippings_count)
+        or page_last_highlighted != clips_last_highlight
+    ):
+        print("~ Page already exists & updates are available")
+        print("~ Clearing content...")
+        number_of_blocks = 0
+        for block in tqdm(notion.blocks.children.list(page), ascii=True):
+            notion.blocks.delete(block)
+            number_of_blocks += 1
+        print(f"~ Cleared {number_of_blocks} from page")
+        print("✓ Old page is now empty!")
+
+    print(f"~ Retrieving & updating clippings... (this might take a while)")
+    page_contents = _update_book_with_clippings(formatted_clippings)
+    for paragraph in tqdm(page_contents, ascii=True):
+
+        def append():
+            notion.blocks.children.append(page, paragraph)
+            time.sleep(0.1)
+
+        execute(append)
+    print(f"✓ Page was populated!")
+
+    if enable_book_cover:
+        # Fetch a book cover from Google Books if the cover for the page is not set
+        if page.cover is None:
+            print("~ Adding book cover...")
+            result = _get_book_cover_uri(title, author)
 
             if result is None:
                 # Set the page cover to a placeholder image
@@ -167,9 +210,21 @@ def _add_book_to_notion(
             else:
                 # Set the page cover to that of the book
                 cover = ExternalFile[result]
-                print("✓ Added book cover.")
+            notion.pages.set(page, cover=cover)
+            print("✓ Book cover added!")
 
-            notion.pages.set(new_page, cover=cover)
+    print("~ Changing page properties...")
+    notion.pages.update(
+        page,
+        **{
+            "Title": Title[title],
+            "Author": RichText[author],
+            "Highlights": Number[clippings_count],
+            "Last Highlighted": Date[last_date.isoformat()],
+            "Last Synced": Date[datetime.now().isoformat()],
+        },
+    )
+    print("✓ Page updated!")
 
     # Logging the changes made
     diff_count = (

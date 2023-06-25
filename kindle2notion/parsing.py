@@ -1,4 +1,4 @@
-from re import findall
+import re
 from typing import Dict, List, Tuple
 
 from dateparser import parse
@@ -103,6 +103,9 @@ def parse_raw_clippings_text(raw_clippings_text: str) -> Dict:
             )
         else:
             passed_clippings_count += 1
+            print("~ Invalid clipping: ")
+            print(raw_clipping_list)
+            print()
 
     print(f"× Passed {passed_clippings_count} bookmarks or unsupported clippings.\n")
     return all_books
@@ -116,7 +119,7 @@ def _parse_author_and_title(raw_clipping_list: List) -> Tuple[str, str]:
     author, title = _parse_raw_author_and_title(raw_clipping_list)
     author, title = _deal_with_exceptions_in_author_name(author, title)
     title = _deal_with_exceptions_in_title(title)
-    return author, title
+    return author.strip(), title.strip()
 
 
 def _parse_page_location_date_and_note(
@@ -166,8 +169,8 @@ def _parse_raw_author_and_title(raw_clipping_list: List) -> Tuple[str, str]:
     author = ""
     title = raw_clipping_list[0]
 
-    if findall(r"\(.*?\)", raw_clipping_list[0]):
-        author = (findall(r"\(.*?\)", raw_clipping_list[0]))[-1]
+    if re.findall(r"\(.*?\)", raw_clipping_list[0]):
+        author = (re.findall(r"\(.*?\)", raw_clipping_list[0]))[-1]
         author = author.removeprefix("(").removesuffix(")")
     else:
         if title not in BOOKS_WO_AUTHORS:
@@ -176,9 +179,9 @@ def _parse_raw_author_and_title(raw_clipping_list: List) -> Tuple[str, str]:
                 f"{title} - No author found. You can manually add the author in the Notion database."
             )
 
-    title = raw_clipping_list[0].replace(author, "").strip().replace(" ()", "")
+    title = re.sub(r"\([^)]*\)", "", raw_clipping_list[0]).replace("()", "").strip()
 
-    return author, title
+    return author.strip(), title.strip()
 
 
 def _deal_with_exceptions_in_author_name(author: str, title: str) -> Tuple[str, str]:
